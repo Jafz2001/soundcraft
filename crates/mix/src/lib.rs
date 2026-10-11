@@ -661,7 +661,8 @@ impl MixEngine {
         // Delay compensation: align every strip to the slowest. Direct-to-main outputs also wait
         // for the slowest aux return. Aux latency has to be read before those outputs are routed,
         // or the first block (and a one-block bounce probe) still sees zero.
-        let pdc = s.edit.delay_compensation;
+        let low_latency = self.recording && s.edit.flag("options.low_latency_monitoring");
+        let pdc = s.edit.delay_compensation && !low_latency;
         if pdc {
             for t in s.tracks.iter().filter(|t| is_aux(t) && !t.inactive) {
                 if let Some(st) = self.strips.get_mut(&t.id) {
@@ -1021,7 +1022,11 @@ fn process_strip(
     }
     let mut gr = 0.0f32;
     let mut latency = 0usize;
+    let skip_plugins = live.recording && s.edit.flag("options.low_latency_monitoring") && (t.mixer.record_arm || t.mixer.input_monitor);
     for (i, ins) in t.mixer.inserts.iter().enumerate() {
+        if skip_plugins {
+            break;
+        }
         let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i)) else { continue };
         if !ins.active || ins.bypass || slot.failed {
             continue;
@@ -3022,6 +3027,21 @@ mod tests {
         }
         render_block(&mut eng, &s, 0);
         assert_eq!((eng.track_latency, eng.latency), (MAX_LATENCY, 2 * MAX_LATENCY));
+    }
+
+    #[test]
+    fn low_latency_recording_bypasses_plugins_on_armed_tracks() {
+        let (mut s, t) = session_with_dc(0.5, 4800);
+        let mut gain = Insert::new("gain");
+        gain.params.insert("gain".into(), -12.0);
+        let track = s.track_mut(t).unwrap();
+        track.mixer.inserts[0] = Some(gain);
+        track.mixer.record_arm = true;
+
+        let normal = render_playback(&s, 4800, 512, true);
+        s.edit.set_flag("options.low_latency_monitoring", true);
+        let low = render_playback(&s, 4800, 512, true);
+        assert!(low[0][4000].abs() > normal[0][4000].abs() * 2.0, "{} vs {}", low[0][4000], normal[0][4000]);
     }
 
     #[test]

@@ -322,6 +322,8 @@ pub struct SoundApp {
     pub frame_ms: f32,
     last_frame: Option<f64>,
     last_meter_poll: f64,
+    /// Original mixing buffer while recording temporarily uses the low-latency buffer.
+    mix_buffer_before_record: Option<f64>,
     /// Movies for the Video window and Video track (decoded in the background).
     pub video: video_track::VideoPool,
     /// The Bounce Mix in progress, rendered a slice per frame.
@@ -398,6 +400,7 @@ impl SoundApp {
             frame_ms: 0.0,
             last_frame: None,
             last_meter_poll: f64::NEG_INFINITY,
+            mix_buffer_before_record: None,
             video: video_track::VideoPool::default(),
             bounce: None,
             #[cfg(test)]
@@ -544,10 +547,30 @@ impl SoundApp {
             }
         };
         self.lost_shown = 0;
+        let already_playing = self.is_playing();
+        if !already_playing && self.engine.session().edit.flag("options.low_latency_monitoring") {
+            let mix = self.engine.session().edit.value("engine.buffer_size", 0.0);
+            let record = self.engine.session().edit.value("engine.record_buffer_size", 128.0).clamp(32.0, 512.0) as u32;
+            let mut config = self.ui.audio.clone();
+            config.buffer_size = Some(record);
+            let next = soundcraft_playback::Player::with_config(self.engine.session_arc(), &config);
+            if !next.silent {
+                if let Some(r) = &self.recorder {
+                    next.set_input(std::sync::Arc::clone(&r.monitor));
+                }
+                if let Some(current) = &self.player {
+                    current.close_editors();
+                }
+                self.player = Some(next);
+                self.mix_buffer_before_record = Some(mix);
+            }
+        }
         if let Some(p) = &self.player {
             p.set_recording(true);
         }
-        let already_playing = self.is_playing();
+        if let Some(r) = &self.recorder {
+            r.arm();
+        }
         self.engine.transport.recording = true;
         if already_playing {
             // Punch in on the fly at the current playhead.
@@ -891,6 +914,16 @@ impl SoundApp {
             p.set_recording(false);
         }
         let plan = self.take_plan.take();
+        if self.mix_buffer_before_record.take().is_some() {
+            let next = soundcraft_playback::Player::with_config(self.engine.session_arc(), &self.ui.audio);
+            if let Some(r) = &self.recorder {
+                next.set_input(std::sync::Arc::clone(&r.monitor));
+            }
+            if let Some(current) = &self.player {
+                current.close_editors();
+            }
+            self.player = Some(next);
+        }
         let Some(r) = &mut self.recorder else { return };
         let (takes, problem) = r.finish();
         let tracks = takes.len().max(1);
