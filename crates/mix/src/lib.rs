@@ -1025,37 +1025,41 @@ fn process_strip(
                             *x = 0.5 * (*x + *y);
                         }
                     }
-                }
-                if contain_failure(inst, &mut strip.buf, frames) {
-                    strip.failures.record(INSTRUMENT_SLOT);
+                    if contain_failure(inst, &mut strip.buf, frames) {
+                        strip.failures.record(INSTRUMENT_SLOT);
+                    }
                 }
             }
             _ => {}
         }
     }
-    let trim = db_to_gain(t.mixer.trim_db) * if t.mixer.phase_invert { -1.0 } else { 1.0 };
-    if (trim - 1.0).abs() > f32::EPSILON {
-        for c in strip.buf.iter_mut() {
-            c.iter_mut().take(frames).for_each(|x| *x *= trim);
-        }
-    }
     let mut gr = 0.0f32;
     let mut latency = 0usize;
-    for (i, ins) in t.mixer.inserts.iter().enumerate() {
-        let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i)) else { continue };
-        if !ins.active || ins.bypass || slot.failed {
-            continue;
+    if !frozen {
+        // A freeze render already contains trim, phase and inserts. Running them again here both
+        // changes the sound and defeats the CPU saving that freezing is meant to provide.
+        let trim = db_to_gain(t.mixer.trim_db) * if t.mixer.phase_invert { -1.0 } else { 1.0 };
+        if (trim - 1.0).abs() > f32::EPSILON {
+            for c in strip.buf.iter_mut() {
+                c.iter_mut().take(frames).for_each(|x| *x *= trim);
+            }
         }
-        apply_params(slot, ins, t, i, pos);
-        slot.plugin.set_transport(&transport);
-        slot.plugin.process(&mut strip.buf, frames);
-        if contain_failure(slot, &mut strip.buf, frames) {
-            strip.failures.record(i);
-            continue;
-        }
-        latency = latency.saturating_add(slot.plugin.latency());
-        if gr == 0.0 {
-            gr = slot.plugin.gain_reduction_db();
+        for (i, ins) in t.mixer.inserts.iter().enumerate() {
+            let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i)) else { continue };
+            if !ins.active || ins.bypass || slot.failed {
+                continue;
+            }
+            apply_params(slot, ins, t, i, pos);
+            slot.plugin.set_transport(&transport);
+            slot.plugin.process(&mut strip.buf, frames);
+            if contain_failure(slot, &mut strip.buf, frames) {
+                strip.failures.record(i);
+                continue;
+            }
+            latency = latency.saturating_add(slot.plugin.latency());
+            if gr == 0.0 {
+                gr = slot.plugin.gain_reduction_db();
+            }
         }
     }
     strip.gr = gr;
@@ -2224,7 +2228,14 @@ pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<
             t.mixer.sends.iter_mut().for_each(|x| *x = None);
             t.mixer.surround = None;
         } else {
-            t.inactive = true;
+            // Keep possible upstream producers alive so Aux/Folder freezes receive their buses.
+            // Suppress only direct main outputs: the target is the sole path printed to main.
+            if t.mixer.output == Route::Main {
+                t.mixer.output = Route::None;
+            }
+            if t.kind == TrackKind::Master {
+                t.inactive = true;
+            }
         }
     }
     let mut out = render_range(&solo, range, 1024);

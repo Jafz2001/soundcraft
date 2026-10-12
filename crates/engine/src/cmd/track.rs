@@ -433,57 +433,69 @@ fn freeze(e: &mut Engine, p: &Value) -> Result<Value> {
         .and_then(Value::as_bool)
         .unwrap_or_else(|| !tracks.iter().all(|id| e.session().track(*id).is_some_and(|t| t.frozen)));
     let mut changed = 0;
-    for id in tracks {
-        if target {
-            let Some(track) = e.session().track(id) else { continue };
+    if target {
+        if e.pending_freeze.is_some() {
+            return Err(bad("track.freeze", "a freeze render is already running"));
+        }
+        let session = e.session_arc();
+        let mut requests = Vec::new();
+        for id in tracks {
+            let Some(track) = session.track(id) else { continue };
             if track.frozen || !matches!(track.kind, TrackKind::Audio | TrackKind::Instrument | TrackKind::Aux | TrackKind::Folder) {
                 continue;
             }
             let end = if matches!(track.kind, TrackKind::Aux | TrackKind::Folder) {
-                e.session().content_end()
+                session.content_end()
             } else {
                 track.clips().iter().map(soundcraft_model::Clip::end).max().unwrap_or(0)
             };
             if end <= 0 {
                 continue;
             }
-            let range = soundcraft_time::Range::new(0, end.saturating_add(e.session().sample_rate.samples(2.0)));
-            let audio = soundcraft_mix::render_track_pre_fader(e.session(), id, range);
-            if audio.is_empty() {
-                continue;
-            }
-            let name = format!("{}_freeze", track.name);
-            let rate = e.session().sample_rate.hz();
-            let source = crate::io::add_source(
-                e.session_mut(),
-                &name,
-                soundcraft_audio_io::AudioBuffer { sample_rate: rate, channels: audio },
-                None,
-                soundcraft_audio_io::FileFormat::Wav,
-            );
-            if let Some(track) = e.session_mut().track_mut(id) {
-                track.frozen = true;
-                track.frozen_source = Some(source);
-                track.frozen_start = range.start;
-                track.frozen_len = range.len();
-                changed += 1;
-            }
-        } else {
-            let source = e.session().track(id).filter(|track| track.frozen).and_then(|track| track.frozen_source);
-            if let Some(track) = e.session_mut().track_mut(id)
-                && track.frozen
-            {
-                track.frozen = false;
-                track.frozen_source = None;
-                track.frozen_start = 0;
-                track.frozen_len = 0;
-                changed += 1;
-            }
-            if let Some(source) = source {
-                let s = e.session_mut();
-                s.sources.retain(|candidate| candidate.id != source);
-                s.pool.remove(source);
-            }
+            requests.push((
+                id,
+                format!("{}_freeze", track.name),
+                soundcraft_time::Range::new(0, end.saturating_add(session.sample_rate.samples(2.0))),
+            ));
+        }
+        if requests.is_empty() {
+            return Ok(json!({"frozen": true, "tracks": 0, "pending": false}));
+        }
+        let count = requests.len();
+        let base_revision = e.revision;
+        let handle = std::thread::Builder::new()
+            .name("soundcraft-freeze".into())
+            .spawn(move || {
+                requests
+                    .into_iter()
+                    .map(|(track, name, range)| crate::FreezeRender {
+                        track,
+                        name,
+                        range,
+                        sample_rate: session.sample_rate.hz(),
+                        audio: soundcraft_mix::render_track_pre_fader(&session, track, range),
+                    })
+                    .collect()
+            })
+            .map_err(|error| EngineError::Internal("track.freeze".into(), error.to_string()))?;
+        e.pending_freeze = Some(crate::FreezeJob { base_revision, handle });
+        return Ok(json!({"frozen": true, "tracks": count, "pending": true}));
+    }
+    for id in tracks {
+        let source = e.session().track(id).filter(|track| track.frozen).and_then(|track| track.frozen_source);
+        if let Some(track) = e.session_mut().track_mut(id)
+            && track.frozen
+        {
+            track.frozen = false;
+            track.frozen_source = None;
+            track.frozen_start = 0;
+            track.frozen_len = 0;
+            changed += 1;
+        }
+        if let Some(source) = source {
+            let s = e.session_mut();
+            s.sources.retain(|candidate| candidate.id != source);
+            s.pool.remove(source);
         }
     }
     Ok(json!({"frozen": target, "tracks": changed}))
@@ -922,6 +934,15 @@ fn route(e: &mut Engine, p: &Value, input: bool) -> Result<Value> {
 mod tests {
     use super::*;
 
+    fn finish_freeze(e: &mut Engine) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while e.has_background_work() && std::time::Instant::now() < deadline {
+            e.poll_background();
+            std::thread::yield_now();
+        }
+        assert!(!e.has_background_work(), "freeze render timed out");
+    }
+
     #[test]
     fn comp_from_alternate_playlist() {
         let mut e = crate::demo::demo_engine();
@@ -1054,26 +1075,49 @@ mod tests {
     fn freeze_renders_audio_and_unfreeze_restores_live_processing() {
         let mut e = crate::demo::demo_engine();
         let kick = e.session().track_by_name("Kick").unwrap().id;
-        e.execute("track.freeze", &json!({"tracks": [kick.0], "frozen": true})).unwrap();
+        for track in &mut e.session_mut().tracks {
+            track.inactive = track.id != kick;
+        }
+        let track = e.session_mut().track_mut(kick).unwrap();
+        track.mixer.trim_db = -6.0;
+        let mut gain = soundcraft_model::Insert::new("gain");
+        gain.params.insert("gain".into(), -12.0);
+        track.mixer.inserts[0] = Some(gain);
+        let range = soundcraft_time::Range::new(e.session().sample_rate.samples(10.0), e.session().sample_rate.samples(11.0));
+        let before = soundcraft_mix::render_range(e.session(), range, 512);
+        let result = e.execute("track.freeze", &json!({"tracks": [kick.0], "frozen": true})).unwrap();
+        assert_eq!(result["pending"], true);
+        finish_freeze(&mut e);
         let frozen = e.session().track(kick).unwrap();
         let source = frozen.frozen_source.unwrap();
         assert!(frozen.frozen && frozen.frozen_len > 0);
         assert!(e.session().pool.get(source).is_some_and(|audio| audio.buffer.channels.iter().flatten().any(|x| x.abs() > 1e-5)));
+        let after = soundcraft_mix::render_range(e.session(), range, 512);
+        let energy = |audio: &[Vec<f32>]| audio.iter().flatten().map(|x| x.abs()).sum::<f32>();
+        let ratio = energy(&after) / energy(&before).max(1e-9);
+        assert!((ratio - 1.0).abs() < 0.02, "freeze changed level: {ratio}");
         e.execute("track.freeze", &json!({"tracks": [kick.0], "frozen": false})).unwrap();
         let live = e.session().track(kick).unwrap();
         assert!(!live.frozen && live.frozen_source.is_none());
         assert!(e.session().pool.get(source).is_none());
+        assert!(e.undo(), "unfreeze must be undoable");
+        let restored = e.session().track(kick).unwrap();
+        assert!(restored.frozen && restored.frozen_source == Some(source));
+        assert!(e.session().pool.get(source).is_some(), "undo must restore the frozen audio");
     }
 
     #[test]
     fn freeze_aux_prints_its_upstream_bus() {
         let mut e = crate::demo::demo_engine();
-        let aux = e.session().tracks.iter().find(|t| matches!(t.kind, TrackKind::Aux | TrackKind::Folder)).map(|t| t.id).unwrap();
+        let kick = e.session().track_by_name("Kick").unwrap().id;
+        let bus = e.session_mut().add_bus("Freeze Aux", ChannelFormat::Stereo);
+        let aux = e.session_mut().add_track(TrackKind::Aux, ChannelFormat::Stereo, Some("Freeze Aux"));
+        e.session_mut().track_mut(kick).unwrap().mixer.output = Route::Bus(bus);
+        e.session_mut().track_mut(aux).unwrap().mixer.input = Route::Bus(bus);
         e.execute("track.freeze", &json!({"tracks": [aux.0], "frozen": true})).unwrap();
+        finish_freeze(&mut e);
         let frozen = e.session().track(aux).unwrap();
         let source = frozen.frozen_source.unwrap();
-        assert!(e.session().pool.get(source).is_some_and(|audio| {
-            !audio.buffer.channels.is_empty() && audio.buffer.channels.iter().all(|channel| channel.len() == frozen.frozen_len as usize)
-        }));
+        assert!(e.session().pool.get(source).is_some_and(|audio| audio.buffer.channels.iter().flatten().any(|x| x.abs() > 1e-7)));
     }
 }
