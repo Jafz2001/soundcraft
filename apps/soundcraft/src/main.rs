@@ -145,10 +145,7 @@ fn cleanup_stale_plugin_scratch() {
     for entry in entries.flatten().take(MAX_ENTRIES) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !["soundcraft-vst3-probe-", "soundcraft-vst3-garbage-", "soundcraft-vst3-scan-", "soundcraft-clap-garbage-", "soundcraft-clap-scan-"]
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
-        {
+        if !["soundcraft-vst3-probe-", "soundcraft-vst3-garbage-", "soundcraft-vst3-scan-"].iter().any(|prefix| name.starts_with(prefix)) {
             continue;
         }
         let path = entry.path();

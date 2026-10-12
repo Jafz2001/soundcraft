@@ -79,37 +79,57 @@ pub(crate) fn validate_instance(path: &Path, id: &str) -> Result<(), Vst3Error> 
     if let Some(ok) = validations.lock().unwrap_or_else(PoisonError::into_inner).get(&key).copied() {
         return if ok { Ok(()) } else { Err(Vst3Error::Instantiate(id.to_string(), "failed isolated validation before".into())) };
     }
-    let result = validate_with(exe, path, id, Duration::from_secs(15));
-    let mut values = validations.lock().unwrap_or_else(PoisonError::into_inner);
-    values.insert(key, result.is_ok());
-    save_validations(&values);
-    result
+    let validation = validate_with(exe, path, id, Duration::from_secs(15));
+    if let Some(ok) = validation.cache {
+        let mut values = validations.lock().unwrap_or_else(PoisonError::into_inner);
+        values.insert(key, ok);
+        save_validations(&values);
+    }
+    validation.result
 }
 
-fn validate_with(exe: &Path, path: &Path, id: &str, timeout: Duration) -> Result<(), Vst3Error> {
+struct Validation {
+    result: Result<(), Vst3Error>,
+    /// Successful validation and a definite child rejection are stable for this bundle stamp.
+    /// Host errors and timeouts are transient and must be retried on the next scan.
+    cache: Option<bool>,
+}
+
+fn validate_with(exe: &Path, path: &Path, id: &str, timeout: Duration) -> Validation {
     let fail = |message: String| Vst3Error::Instantiate(id.to_string(), message);
-    let mut child = Command::new(exe)
-        .arg("--validate-vst3")
-        .arg(path)
-        .arg(id)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| fail(e.to_string()))?;
+    let mut child =
+        match Command::new(exe).arg("--validate-vst3").arg(path).arg(id).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+            Ok(child) => child,
+            Err(e) => return Validation { result: Err(fail(e.to_string())), cache: None },
+        };
     let started = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => return Err(fail(format!("isolated validator crashed or rejected plugin ({status}); skipped"))),
+            Ok(Some(status)) if status.success() => return Validation { result: Ok(()), cache: Some(true) },
+            Ok(Some(status)) => {
+                return Validation {
+                    result: Err(fail(format!("isolated validator crashed or rejected plugin ({status}); skipped"))),
+                    cache: Some(false),
+                };
+            }
             Ok(None) if started.elapsed() < timeout => std::thread::sleep(Duration::from_millis(20)),
             other => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(fail(if other.is_err() { "validator wait failed".into() } else { "validator timed out; plugin skipped".into() }));
+                return Validation {
+                    result: Err(fail(if other.is_err() { "validator wait failed".into() } else { "validator timed out; plugin skipped".into() })),
+                    cache: None,
+                };
             }
         }
     }
+}
+
+pub(crate) fn clear_failed_validations() {
+    let validations = VALIDATED.get_or_init(|| Mutex::new(load_validations()));
+    let mut values = validations.lock().unwrap_or_else(PoisonError::into_inner);
+    values.retain(|_, ok| *ok);
+    save_validations(&values);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,41 +228,32 @@ fn flatten(cache: &ScanCache) -> Vec<Vst3Descriptor> {
     out
 }
 
-/// Uses unchanged entries from the on-disk catalog. Normal startup never launches scanner
-/// processes: newly installed or updated plugins become available after an explicit forced scan.
-pub(crate) fn scan_cached(dirs: &[PathBuf], force: bool) -> Vec<Vst3Descriptor> {
-    let bundles = crate::scan::find_bundles(dirs);
-    if !force
-        && let Some(path) = CACHE.get()
-        && let Some(cache) = read_cache(path, &bundles)
-    {
-        SKIPPED.store(cache.bundles.iter().filter(|b| b.failed).count() as u64, Ordering::Relaxed);
-        return flatten(&cache);
+fn admitted(cache: &ScanCache) -> Vec<Vst3Descriptor> {
+    let mut descriptors = flatten(cache);
+    if HELPER.get().is_some() {
+        descriptors.retain(|descriptor| match validate_instance(&descriptor.path, &descriptor.id) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("{e}");
+                false
+            }
+        });
     }
+    descriptors
+}
 
-    if !force {
-        let Some(previous) = CACHE.get().and_then(|path| load_cache(path)) else {
-            return Vec::new();
-        };
-        let usable = ScanCache {
-            version: CACHE_VERSION,
-            bundles: bundles
-                .iter()
-                .filter_map(|path| {
-                    let stamp = bundle_stamp(path)?;
-                    previous.bundles.iter().find(|old| old.path == *path && old.stamp == stamp).cloned()
-                })
-                .collect(),
-        };
-        SKIPPED.store(usable.bundles.iter().filter(|bundle| bundle.failed).count() as u64, Ordering::Relaxed);
-        return flatten(&usable);
-    }
-
-    SKIPPED.store(0, Ordering::Relaxed);
+fn refresh_cache<F>(bundles: Vec<PathBuf>, previous: Option<&ScanCache>, force: bool, mut probe_bundle: F) -> ScanCache
+where
+    F: FnMut(&Path) -> Result<Vec<Vst3Descriptor>, Vst3Error>,
+{
     let mut cached = Vec::with_capacity(bundles.len());
     for path in bundles {
         let stamp = bundle_stamp(&path).unwrap_or(BundleStamp { bytes: 0, modified_secs: 0, modified_nanos: 0 });
-        let (descriptors, failed) = match probe(&path) {
+        if !force && let Some(old) = previous.and_then(|cache| cache.bundles.iter().find(|old| old.path == path && old.stamp == stamp)) {
+            cached.push(old.clone());
+            continue;
+        }
+        let (descriptors, failed) = match probe_bundle(&path) {
             Ok(found) => (found, false),
             Err(e) => {
                 log::warn!("{e}");
@@ -251,13 +262,29 @@ pub(crate) fn scan_cached(dirs: &[PathBuf], force: bool) -> Vec<Vst3Descriptor> 
         };
         cached.push(CachedBundle { path, stamp, descriptors, failed });
     }
-    let cache = ScanCache { version: CACHE_VERSION, bundles: cached };
+    ScanCache { version: CACHE_VERSION, bundles: cached }
+}
+
+/// Reuses unchanged entries from the on-disk catalog and probes only new or changed bundles.
+pub(crate) fn scan_cached(dirs: &[PathBuf], force: bool) -> Vec<Vst3Descriptor> {
+    let bundles = crate::scan::find_bundles(dirs);
+    if !force
+        && let Some(path) = CACHE.get()
+        && let Some(cache) = read_cache(path, &bundles)
+    {
+        SKIPPED.store(cache.bundles.iter().filter(|b| b.failed).count() as u64, Ordering::Relaxed);
+        return admitted(&cache);
+    }
+
+    let previous = CACHE.get().and_then(|path| load_cache(path));
+    let cache = refresh_cache(bundles, previous.as_ref(), force, probe);
+    SKIPPED.store(cache.bundles.iter().filter(|bundle| bundle.failed).count() as u64, Ordering::Relaxed);
     if let Some(path) = CACHE.get()
         && let Err(e) = write_cache(path, &cache)
     {
         log::warn!("could not save VST3 scan cache {}: {e}", path.display());
     }
-    flatten(&cache)
+    admitted(&cache)
 }
 
 struct Scratch(PathBuf);
@@ -322,31 +349,6 @@ fn probe_with(exe: &Path, path: &Path, timeout: Duration) -> Result<Vec<Vst3Desc
     Ok(ds)
 }
 
-/// Poll discovery without running plugin code or waiting for a child on the UI thread.
-pub fn menu_plugins() -> Option<Vec<Vst3Descriptor>> {
-    type ScanResult = Option<Result<Vec<Vst3Descriptor>, String>>;
-    static RESULT: OnceLock<std::sync::Arc<Mutex<ScanResult>>> = OnceLock::new();
-    let result = RESULT.get_or_init(|| {
-        let result = std::sync::Arc::new(Mutex::new(None));
-        let worker = result.clone();
-        if let Err(e) = std::thread::Builder::new().name("vst3-discovery".into()).spawn(move || {
-            // The host may be embedded by an executable without helper support; do not load
-            // untrusted libraries on a worker thread in that case.
-            let scanned = if HELPER.get().is_some() { Ok(crate::scan()) } else { Err("VST3 scan helper is not configured".into()) };
-            *worker.lock().unwrap_or_else(PoisonError::into_inner) = Some(scanned);
-        }) {
-            *result.lock().unwrap_or_else(PoisonError::into_inner) = Some(Err(e.to_string()));
-        }
-        result
-    });
-    let state = result.lock().unwrap_or_else(PoisonError::into_inner);
-    match state.as_ref() {
-        None => None,
-        Some(Ok(list)) => Some(list.clone()),
-        Some(Err(_)) => Some(Vec::new()),
-    }
-}
-
 #[cfg(all(test, unix))]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -383,11 +385,17 @@ mod tests {
     #[test]
     fn crashed_or_hung_instance_validator_is_contained() {
         let (_d, exe) = helper("kill -KILL $$");
-        assert!(validate_with(&exe, Path::new("broken.vst3"), "vst3:00000000000000000000000000000000", Duration::from_secs(1)).is_err());
+        let crashed = validate_with(&exe, Path::new("broken.vst3"), "vst3:00000000000000000000000000000000", Duration::from_secs(1));
+        assert!(crashed.result.is_err());
+        assert_eq!(crashed.cache, Some(false));
         let (_d, exe) = helper("exit 0");
-        assert!(validate_with(&exe, Path::new("healthy.vst3"), "vst3:00000000000000000000000000000000", Duration::from_secs(1)).is_ok());
+        let healthy = validate_with(&exe, Path::new("healthy.vst3"), "vst3:00000000000000000000000000000000", Duration::from_secs(1));
+        assert!(healthy.result.is_ok());
+        assert_eq!(healthy.cache, Some(true));
         let (_d, exe) = helper("exec sleep 30");
-        assert!(validate_with(&exe, Path::new("hung.vst3"), "vst3:00000000000000000000000000000000", Duration::from_millis(50)).is_err());
+        let hung = validate_with(&exe, Path::new("hung.vst3"), "vst3:00000000000000000000000000000000", Duration::from_millis(50));
+        assert!(hung.result.is_err());
+        assert_eq!(hung.cache, None);
     }
 
     #[test]
@@ -406,6 +414,32 @@ mod tests {
         assert!(read_cache(&cache_path, std::slice::from_ref(&bundle)).is_some());
         std::fs::write(&bundle, b"changed plugin binary").unwrap();
         assert!(read_cache(&cache_path, std::slice::from_ref(&bundle)).is_none());
+        drop(scratch);
+    }
+
+    #[test]
+    fn first_scan_and_new_bundles_are_probed_without_force() {
+        let dir = std::env::temp_dir().join(format!("sc-refresh-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir(&dir).unwrap();
+        let scratch = Scratch(dir.clone());
+        let first = dir.join("First.vst3");
+        let second = dir.join("Second.vst3");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+
+        let mut probed = Vec::new();
+        let initial = refresh_cache(vec![first.clone()], None, false, |path| {
+            probed.push(path.to_path_buf());
+            Ok(Vec::new())
+        });
+        assert_eq!(probed, vec![first.clone()]);
+
+        probed.clear();
+        let _updated = refresh_cache(vec![first, second.clone()], Some(&initial), false, |path| {
+            probed.push(path.to_path_buf());
+            Ok(Vec::new())
+        });
+        assert_eq!(probed, vec![second]);
         drop(scratch);
     }
 }

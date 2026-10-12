@@ -99,6 +99,7 @@ pub fn scan() -> Vec<Vst3Descriptor> {
 pub fn rescan() -> Vec<Vst3Descriptor> {
     let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
     r.failed.clear();
+    crate::isolated_scan::clear_failed_validations();
     let mut dirs = paths::default_search_paths();
     dirs.extend(r.extra_dirs.iter().cloned());
     let scanned = crate::isolated_scan::scan_cached(&dirs, true);
@@ -215,7 +216,9 @@ fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo), Vst3Erro
         }
         ensure_scanned(&mut r).iter().find(|d| d.id == id).cloned().ok_or_else(|| Vst3Error::NotFound(id.to_string()))?
     };
-    let made = crate::isolated_scan::validate_instance(&desc.path, id).and_then(|()| Bundle::load(&desc.path).and_then(|b| b.instantiate(&cid)));
+    // Desktop discovery already validated this exact bundle stamp in a disposable child. Create
+    // the one live instance here instead of repeating a blocking 15-second safety check.
+    let made = Bundle::load(&desc.path).and_then(|b| b.instantiate(&cid));
     let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
     match made {
         Ok(inst) => {
